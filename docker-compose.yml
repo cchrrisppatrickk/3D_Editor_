@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      # Monta el directorio local en el contenedor para el hot reload
+      - .:/app
+      # Evita sobreescribir node_modules del contenedor con el local (especialmente util si host es Windows)
+      - /app/node_modules
+      # Evita sobreescribir la carpeta .next compilada en el contenedor
+      - /app/.next
+    environment:
+      - NODE_ENV=development
+      # Polling explícito para asegurar que el hot reload funcione correctamente a través de Docker en Windows/WSL
+      - WATCHPACK_POLLING=true
+      - CHOKIDAR_USEPOLLING=true
