@@ -10,47 +10,82 @@ import { useRetargetStore } from '@/store/useRetargetStore';
 import { getMixamoBoneName } from '@/lib/boneMap';
 import { CameraRig, type CameraViewPreset } from '@/components/CameraRig';
 import ViewportOverlay from '@/components/ViewportOverlay';
-import { applyTwoBoneIK } from '@/lib/ikSolver';
+import { applyTwoBoneIK, detectKneeFlexAxis } from '@/lib/ikSolver';
+
+// ─── Helpers de carga ────────────────────────────────────────────────────────
 
 async function loadFile(url: string, type: string) {
   if (type === 'fbx') {
-    const loader = new FBXLoader();
-    return await loader.loadAsync(url);
-  } else {
-    const loader = new GLTFLoader();
-    const gltf = await loader.loadAsync(url);
-    const scene = gltf.scene;
-    scene.animations = gltf.animations; // Mantenemos las animaciones referenciadas
-    return scene;
+    return await new FBXLoader().loadAsync(url);
   }
+  const gltf = await new GLTFLoader().loadAsync(url);
+  gltf.scene.animations = gltf.animations;
+  return gltf.scene;
 }
+
+/** Mide la longitud total de la pierna en World Space (UpLeg → Leg → Foot) */
+function measureLegLength(
+  upLeg: THREE.Bone | null,
+  leg: THREE.Bone | null,
+  foot: THREE.Bone | null
+): number {
+  if (!upLeg || !leg || !foot) return 0;
+  const a = new THREE.Vector3(); upLeg.getWorldPosition(a);
+  const b = new THREE.Vector3(); leg.getWorldPosition(b);
+  const c = new THREE.Vector3(); foot.getWorldPosition(c);
+  return a.distanceTo(b) + b.distanceTo(c);
+}
+
+// ─── Tipos de datos de calibración ──────────────────────────────────────────
+
+interface CalibrationData {
+  // Posiciones de reposo
+  sourceRestHip: THREE.Vector3;
+  targetRestHip: THREE.Vector3;
+  // Escala de movimiento horizontal (ratio de longitud de pierna)
+  scaleXZ: number;
+  // Longitud pierna source/target (para ratio Y)
+  sourceLegLength: number;
+  targetLegLength: number;
+}
+
+// ─── Componente principal 3D ─────────────────────────────────────────────────
 
 function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
   const [targetScene, setTargetScene] = useState<THREE.Object3D | null>(null);
   const [sourceScene, setSourceScene] = useState<THREE.Object3D | null>(null);
-  const mixer = useRef<THREE.AnimationMixer | null>(null);
-  
-  // Array de mapeo: empareja hueso de animación con hueso de modelo
-  const boneMapRef = useRef<{ source: THREE.Bone; target: THREE.Bone }[]>([]);
-  const sourceRootRef = useRef<THREE.Bone | null>(null);
-  const targetRootRef = useRef<THREE.Bone | null>(null);
-  const sourceFootBonesRef = useRef<{ left: THREE.Bone | null, right: THREE.Bone | null }>({ left: null, right: null });
-  const targetFootBonesRef = useRef<{ left: THREE.Bone | null, right: THREE.Bone | null }>({ left: null, right: null });
-  const offsetsRef = useRef<Map<string, THREE.Quaternion>>(new Map());
-  const positionDataRef = useRef<{ 
-    sourceRestHip: THREE.Vector3;
-    targetRestHip: THREE.Vector3;
-    scaleXZ: number;  // escala horizontal
-    hipToFloorSource: number; // distancia cadera→piso en source rest
-    hipToFloorTarget: number; // distancia cadera→piso en target rest
-  } | null>(null);
 
-  // Evitar re-renders a 60fps usando getState() en useFrame
-  const setDuration = useRetargetStore(state => state.setDuration);
-  const setKeyframes = useRetargetStore(state => state.setKeyframes);
-  const setCurrentTime = useRetargetStore(state => state.setCurrentTime);
-  const durationRef = useRef(0);
-  const lastTimeRef = useRef(0);
+  const mixer           = useRef<THREE.AnimationMixer | null>(null);
+  const boneMapRef      = useRef<{ source: THREE.Bone; target: THREE.Bone }[]>([]);
+  const offsetsRef      = useRef<Map<string, THREE.Quaternion>>(new Map());
+  const calibRef        = useRef<CalibrationData | null>(null);
+  const sourceRootRef   = useRef<THREE.Bone | null>(null);
+  const targetRootRef   = useRef<THREE.Bone | null>(null);
+
+  // Pies source y target
+  const sFeet = useRef<{ left: THREE.Bone | null; right: THREE.Bone | null }>({ left: null, right: null });
+  const tFeet = useRef<{ left: THREE.Bone | null; right: THREE.Bone | null }>({ left: null, right: null });
+
+  // Pierna completa source/target para medir longitudes
+  const sLeg = useRef<{ upLeg: THREE.Bone | null; leg: THREE.Bone | null; foot: THREE.Bone | null }>({ upLeg: null, leg: null, foot: null });
+  const tLeg = useRef<{ upLeg: THREE.Bone | null; leg: THREE.Bone | null; foot: THREE.Bone | null }>({ upLeg: null, leg: null, foot: null });
+
+  // Eje de flexión de rodilla detectado por rig
+  const kneeFlexAxis = useRef<{ left: 'x'|'y'|'z'; right: 'x'|'y'|'z' }>({ left: 'x', right: 'x' });
+
+  // Velocidad de pies para IK blend weight
+  const lastFootPos = useRef<{
+    left: THREE.Vector3;
+    right: THREE.Vector3;
+  }>({ left: new THREE.Vector3(), right: new THREE.Vector3() });
+
+  // Store
+  const setDuration    = useRetargetStore(s => s.setDuration);
+  const setKeyframes   = useRetargetStore(s => s.setKeyframes);
+  const setCurrentTime = useRetargetStore(s => s.setCurrentTime);
+  const lastTimeRef    = useRef(0);
+
+  // ── Carga e inicialización ───────────────────────────────────────────────
 
   useEffect(() => {
     let active = true;
@@ -58,6 +93,7 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
     mixer.current = null;
     sourceRootRef.current = null;
     targetRootRef.current = null;
+    calibRef.current = null;
     setTargetScene(null);
     setSourceScene(null);
 
@@ -65,207 +101,183 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
       try {
         const [targetModel, sourceModel] = await Promise.all([
           targetFile ? loadFile(targetFile.fileUrl, targetFile.type) : Promise.resolve(null),
-          sourceFile ? loadFile(sourceFile.fileUrl, sourceFile.type) : Promise.resolve(null)
+          sourceFile ? loadFile(sourceFile.fileUrl, sourceFile.type) : Promise.resolve(null),
         ]);
-        
         if (!active) return;
 
+        // — Target —
         let tRoot: THREE.Bone | null = null;
         if (targetModel) {
-          targetModel.traverse((child) => {
-            if ((child as THREE.Bone).isBone && !tRoot) {
-              tRoot = child as THREE.Bone;
-            }
+          targetModel.traverse(child => {
+            if ((child as THREE.Bone).isBone && !tRoot) tRoot = child as THREE.Bone;
           });
           targetRootRef.current = tRoot;
           setTargetScene(targetModel);
         }
 
+        // — Source —
         if (sourceModel) {
           let sRoot: THREE.Bone | null = null;
-          
-          sourceModel.traverse((child) => {
-             // Ocultar geometría de la fuente (solo queremos los huesos)
-            if ((child as THREE.Mesh).isMesh) {
-              child.visible = false;
-            }
-            if ((child as THREE.Bone).isBone && !sRoot) {
-              sRoot = child as THREE.Bone;
-            }
+          sourceModel.traverse(child => {
+            if ((child as THREE.Mesh).isMesh) child.visible = false;
+            if ((child as THREE.Bone).isBone && !sRoot) sRoot = child as THREE.Bone;
           });
           sourceRootRef.current = sRoot;
 
-          // Iniciar la animación del Mocap y extraer datos para la línea de tiempo
-          if (sourceModel.animations && sourceModel.animations.length > 0) {
+          // Animación + timeline
+          if (sourceModel.animations?.length > 0) {
             const clip = sourceModel.animations[0];
             mixer.current = new THREE.AnimationMixer(sourceModel);
-            const action = mixer.current.clipAction(clip);
-            action.play();
-            
-            durationRef.current = clip.duration;
+            mixer.current.clipAction(clip).play();
             setDuration(clip.duration);
 
-            // Extraer tiempos únicos para pintar los keyframes (puntos) en el timeline
             const uniqueTimes = new Set<number>();
             for (const track of clip.tracks) {
-              if (track.times && track.times.length > 0) {
+              if (track.times?.length > 0) {
                 for (let i = 0; i < track.times.length; i++) {
-                  uniqueTimes.add(Number(track.times[i].toFixed(3))); 
+                  uniqueTimes.add(Number(track.times[i].toFixed(3)));
                 }
-                break; // Con un solo track de mocap basta para conocer la cadencia de keyframes
+                break;
               }
             }
             setKeyframes(Array.from(uniqueTimes).sort((a, b) => a - b));
           }
 
-          // Crear un visualizador visual (rosa) para los huesos origen
-          if (sRoot || sourceModel) {
-            const helper = new THREE.SkeletonHelper(sRoot || sourceModel);
-            (helper.material as THREE.LineBasicMaterial).color = new THREE.Color('#ff00aa');
-            (helper.material as THREE.LineBasicMaterial).depthTest = false;
-            (helper.material as THREE.LineBasicMaterial).transparent = true;
-            (helper.material as THREE.LineBasicMaterial).opacity = 0.8;
-            helper.visible = showSourceSkeleton;
-            helper.name = "SourceSkeletonHelper";
-            sourceModel.add(helper);
-          }
-          
+          // SkeletonHelper rosa (source)
+          const helperRoot = sRoot ?? sourceModel;
+          const helper = new THREE.SkeletonHelper(helperRoot);
+          (helper.material as THREE.LineBasicMaterial).color     = new THREE.Color('#ff00aa');
+          (helper.material as THREE.LineBasicMaterial).depthTest = false;
+          (helper.material as THREE.LineBasicMaterial).transparent = true;
+          (helper.material as THREE.LineBasicMaterial).opacity   = 0.8;
+          helper.visible = showSourceSkeleton;
+          helper.name    = 'SourceSkeletonHelper';
+          sourceModel.add(helper);
           setSourceScene(sourceModel);
         }
 
-        // --- EL CORAZÓN DEL RETARGETING ---
-        // Construir el mapeo entre el esqueleto de origen y el de destino usando el diccionario
+        // — Mapeo de huesos + calibración —
         if (targetModel && sourceModel) {
           const map: { source: THREE.Bone; target: THREE.Bone }[] = [];
-          
-          sourceModel.traverse((sNode) => {
-            if ((sNode as THREE.Bone).isBone) {
-              const sBone = sNode as THREE.Bone;
-              const expectedTargetName = getMixamoBoneName(sBone.name);
-              
-              if (expectedTargetName) {
-                targetModel.traverse((tNode) => {
-                  if ((tNode as THREE.Bone).isBone && tNode.name === expectedTargetName) {
-                    map.push({ source: sBone, target: tNode as THREE.Bone });
-                  }
-                });
+
+          sourceModel.traverse(sNode => {
+            if (!(sNode as THREE.Bone).isBone) return;
+            const sBone = sNode as THREE.Bone;
+            const tName = getMixamoBoneName(sBone.name);
+            if (!tName) return;
+            targetModel.traverse(tNode => {
+              if ((tNode as THREE.Bone).isBone && tNode.name === tName) {
+                map.push({ source: sBone, target: tNode as THREE.Bone });
               }
-            }
+            });
           });
-          
+
           boneMapRef.current = map;
 
-          // 1. Forzar actualización de matrices en la pose base (Rest Pose)
+          // Actualizar matrices en rest pose
           targetModel.updateMatrixWorld(true);
           sourceModel.updateMatrixWorld(true);
 
-          // 2. Calcular Offsets de Cuaterniones (Diferencia de ejes locales entre Source y Target)
+          // ── P1 FIX: Offset correcto = T_world * S_world_inv ────────────────
+          // Esto nos da el "cambio de base" del esqueleto source al target en rest pose.
+          // Al aplicarlo en runtime: desired_T_world = offset * S_world_current
           const offsets = new Map<string, THREE.Quaternion>();
           map.forEach(({ source, target }) => {
             const sWorld = new THREE.Quaternion();
-            source.getWorldQuaternion(sWorld);
-            
             const tWorld = new THREE.Quaternion();
+            source.getWorldQuaternion(sWorld);
             target.getWorldQuaternion(tWorld);
-            
-            // offset = sourceWorld^-1 * targetWorld
-            const offset = sWorld.invert().multiply(tWorld);
+
+            // T * S^-1  (Correct retargeting offset)
+            const offset = tWorld.clone().multiply(sWorld.clone().invert());
             offsets.set(source.uuid, offset);
           });
           offsetsRef.current = offsets;
 
-          // 3. Calcular escala y datos de contacto de pies en WORLD SPACE
-          if (sourceRootRef.current && targetRootRef.current) {
-            // Forzar actualización de matrices en pose base
-            targetModel.updateMatrixWorld(true);
-            sourceModel.updateMatrixWorld(true);
+          // Recolectar referencias de piernas izquierda y derecha
+          sFeet.current = { left: null, right: null };
+          tFeet.current = { left: null, right: null };
+          sLeg.current  = { upLeg: null, leg: null, foot: null };
+          tLeg.current  = { upLeg: null, leg: null, foot: null };
 
-            const sHipWorld = new THREE.Vector3();
-            sourceRootRef.current.getWorldPosition(sHipWorld);
-            const tHipWorld = new THREE.Vector3();
-            targetRootRef.current.getWorldPosition(tHipWorld);
+          map.forEach(({ source, target }) => {
+            // Source
+            if (source.name === 'LeftFoot')   { sFeet.current.left  = source; sLeg.current.foot  = source; }
+            if (source.name === 'RightFoot')  { sFeet.current.right = source; }
+            if (source.name === 'LeftUpLeg')  { sLeg.current.upLeg  = source; }
+            if (source.name === 'LeftLeg')    { sLeg.current.leg    = source; }
+            // Target
+            if (target.name === 'mixamorigLeftFoot')   { tFeet.current.left  = target; tLeg.current.foot  = target; }
+            if (target.name === 'mixamorigRightFoot')  { tFeet.current.right = target; }
+            if (target.name === 'mixamorigLeftUpLeg')  { tLeg.current.upLeg  = target; }
+            if (target.name === 'mixamorigLeftLeg')    { tLeg.current.leg    = target; }
+          });
 
-            // Guardar refs de pies en world space
-            sourceFootBonesRef.current = { left: null, right: null };
-            targetFootBonesRef.current = { left: null, right: null };
+          // Detectar eje de flexión de rodilla automáticamente
+          const leftKneeTarget  = map.find(m => m.target.name === 'mixamorigLeftLeg')?.target  as THREE.Bone | undefined;
+          const rightKneeTarget = map.find(m => m.target.name === 'mixamorigRightLeg')?.target as THREE.Bone | undefined;
+          kneeFlexAxis.current.left  = leftKneeTarget  ? detectKneeFlexAxis(leftKneeTarget)  : 'x';
+          kneeFlexAxis.current.right = rightKneeTarget ? detectKneeFlexAxis(rightKneeTarget) : 'x';
 
-            map.forEach(({ source, target }) => {
-              if (source.name === 'LeftFoot')  sourceFootBonesRef.current.left  = source;
-              if (source.name === 'RightFoot') sourceFootBonesRef.current.right = source;
-              if (target.name === 'mixamorigLeftFoot')  targetFootBonesRef.current.left  = target;
-              if (target.name === 'mixamorigRightFoot') targetFootBonesRef.current.right = target;
-            });
+          // Inicializar posición de pies para velocidad
+          if (sFeet.current.left)  sFeet.current.left.getWorldPosition(lastFootPos.current.left);
+          if (sFeet.current.right) sFeet.current.right.getWorldPosition(lastFootPos.current.right);
 
-            // Medir la distancia cadera→pie en world space (= longitud real de la pierna)
-            let hipToFloorSource = sHipWorld.y; // Si no hay pie, usamos la altura de la cadera
-            if (sourceFootBonesRef.current.left) {
-              const p = new THREE.Vector3();
-              sourceFootBonesRef.current.left.getWorldPosition(p);
-              hipToFloorSource = sHipWorld.y - p.y;
-            }
+          // ── P2 FIX: Escala por longitud real de pierna ──────────────────────
+          const sLegLen = measureLegLength(sLeg.current.upLeg, sLeg.current.leg, sLeg.current.foot);
+          const tLegLen = measureLegLength(tLeg.current.upLeg, tLeg.current.leg, tLeg.current.foot);
 
-            let hipToFloorTarget = tHipWorld.y;
-            if (targetFootBonesRef.current.left) {
-              const p = new THREE.Vector3();
-              targetFootBonesRef.current.left.getWorldPosition(p);
-              hipToFloorTarget = tHipWorld.y - p.y;
-            }
+          const sHipWorld = new THREE.Vector3(); sourceRootRef.current!.getWorldPosition(sHipWorld);
+          const tHipWorld = new THREE.Vector3(); targetRootRef.current!.getWorldPosition(tHipWorld);
 
-            // Escala XZ: ratio de alturas de cadera (para movimiento horizontal correcto)
-            const scaleXZ = sHipWorld.y !== 0 ? tHipWorld.y / sHipWorld.y : 1;
+          // ScaleXZ: ratio de longitud de pierna (mejor que ratio de altura de cadera)
+          const scaleXZ = sLegLen > 0 ? tLegLen / sLegLen : (sHipWorld.y > 0 ? tHipWorld.y / sHipWorld.y : 1);
 
-            positionDataRef.current = {
-              sourceRestHip: sHipWorld,
-              targetRestHip: tHipWorld,
-              scaleXZ: Math.abs(scaleXZ),
-              hipToFloorSource,
-              hipToFloorTarget,
-            };
-          }
+          calibRef.current = {
+            sourceRestHip:  sHipWorld.clone(),
+            targetRestHip:  tHipWorld.clone(),
+            scaleXZ:        Math.abs(scaleXZ),
+            sourceLegLength: sLegLen > 0 ? sLegLen : sHipWorld.y,
+            targetLegLength: tLegLen > 0 ? tLegLen : tHipWorld.y,
+          };
         }
-
       } catch (e) {
-        console.error("Error cargando modelos de retargeting:", e);
+        console.error('Error cargando modelos de retargeting:', e);
       }
     }
+
     init();
-
     return () => { active = false; };
-  }, [targetFile, sourceFile]); // Omitimos showSourceSkeleton para no recargar modelos al hacer toggle
+  }, [targetFile, sourceFile]);
 
-  // Controlar la visibilidad del esqueleto de origen en tiempo real sin desmontar
+  // Visibilidad del helper source en tiempo real
   useEffect(() => {
-    if (sourceScene) {
-      const helper = sourceScene.getObjectByName("SourceSkeletonHelper");
-      if (helper) {
-        helper.visible = showSourceSkeleton;
-      }
-    }
+    if (!sourceScene) return;
+    const helper = sourceScene.getObjectByName('SourceSkeletonHelper');
+    if (helper) helper.visible = showSourceSkeleton;
   }, [showSourceSkeleton, sourceScene]);
 
-  // Actualización Frame a Frame
-  useFrame((state, delta) => {
+  // ── Loop de animación ────────────────────────────────────────────────────
+
+  useFrame((_state, delta) => {
+    // — Playback del mixer —
     if (mixer.current) {
-      // Leemos el estado global directamente sin suscribir a React para no causar re-renders a 60fps
       const { isPlaying, isScrubbing, currentTime } = useRetargetStore.getState();
 
       if (isScrubbing) {
         mixer.current.setTime(currentTime);
-        mixer.current.update(0); // Forzar que los huesos adopten la posición
+        mixer.current.update(0);
         lastTimeRef.current = currentTime;
       } else {
-        // ¿Alguien dio click en el timeline u otra parte alterando el currentTime exteriormente?
         if (Math.abs(currentTime - lastTimeRef.current) > 0.001 && !isPlaying) {
-            mixer.current.setTime(currentTime);
-            mixer.current.update(0);
-            lastTimeRef.current = currentTime;
+          mixer.current.setTime(currentTime);
+          mixer.current.update(0);
+          lastTimeRef.current = currentTime;
         }
-
         if (isPlaying) {
           mixer.current.update(delta);
-          
-          // Leer tiempo actual del action de loop
-          const action = mixer.current.clipAction(mixer.current._root.animations[0]);
+          const anim = (mixer.current as any)._root?.animations?.[0];
+          const action = anim ? mixer.current.clipAction(anim) : null;
           if (action) {
             setCurrentTime(action.time);
             lastTimeRef.current = action.time;
@@ -274,137 +286,137 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
       }
     }
 
-    // RETARGETING EN ACCIÓN
-    if (boneMapRef.current.length > 0 && targetScene && sourceScene) {
+    if (boneMapRef.current.length === 0 || !targetScene || !sourceScene) return;
+
+    sourceScene.updateMatrixWorld(true);
+    const calib = calibRef.current;
+
+    // ── PASO 1 — Posición de cadera (escalada) ────────────────────────────
+    if (calib && sourceRootRef.current && targetRootRef.current) {
+      const sHipNow = new THREE.Vector3();
+      sourceRootRef.current.getWorldPosition(sHipNow);
+
+      // Movimiento horizontal escalado por longitud de pierna
+      const dX = (sHipNow.x - calib.sourceRestHip.x) * calib.scaleXZ;
+      const dZ = (sHipNow.z - calib.sourceRestHip.z) * calib.scaleXZ;
+
+      // Movimiento vertical: escalar por ratio de longitud de pierna
+      const legRatio = calib.sourceLegLength > 0
+        ? calib.targetLegLength / calib.sourceLegLength
+        : 1;
+      const dY = (sHipNow.y - calib.sourceRestHip.y) * legRatio;
+
+      const newWorldPos = new THREE.Vector3(
+        calib.targetRestHip.x + dX,
+        calib.targetRestHip.y + dY,
+        calib.targetRestHip.z + dZ,
+      );
+
+      // Convertir a Local Space del padre de la cadera target
+      const tHipParent = targetRootRef.current.parent;
+      if (tHipParent) {
+        const invParent = new THREE.Matrix4().copy(tHipParent.matrixWorld).invert();
+        newWorldPos.applyMatrix4(invParent);
+      }
+
+      targetRootRef.current.position.copy(newWorldPos);
+      targetRootRef.current.updateMatrix();
+      if (targetRootRef.current.parent) {
+        targetRootRef.current.matrixWorld.multiplyMatrices(
+          targetRootRef.current.parent.matrixWorld,
+          targetRootRef.current.matrix
+        );
+      } else {
+        targetRootRef.current.matrixWorld.copy(targetRootRef.current.matrix);
+      }
+    }
+
+    // ── PASO 2 — Rotaciones con offset corregido (T * S^-1) ──────────────
+    // Fórmula correcta: desired_T_world = offset * S_world_current
+    boneMapRef.current.forEach(({ source, target }) => {
+      const offset = offsetsRef.current.get(source.uuid);
+      if (!offset) return;
+
+      const sWorld = new THREE.Quaternion();
+      source.getWorldQuaternion(sWorld);
+
+      // desired = offset * sWorld  (P1 fix — antes era sWorld * offset)
+      const desiredTWorld = offset.clone().multiply(sWorld);
+
+      const tParentWorld = new THREE.Quaternion();
+      if (target.parent) target.parent.getWorldQuaternion(tParentWorld);
+
+      target.quaternion.copy(tParentWorld.invert().multiply(desiredTWorld));
+      target.updateMatrix();
+      if (target.parent) {
+        target.matrixWorld.multiplyMatrices(target.parent.matrixWorld, target.matrix);
+      } else {
+        target.matrixWorld.copy(target.matrix);
+      }
+    });
+
+    // ── PASO 3 — IK Pass con blend por velocidad de pie ──────────────────
+    if (calib && sourceRootRef.current && targetRootRef.current) {
+      targetScene.updateMatrixWorld(true);
       sourceScene.updateMatrixWorld(true);
 
-      const pData = positionDataRef.current;
+      const legRatio = calib.sourceLegLength > 0
+        ? calib.targetLegLength / calib.sourceLegLength
+        : 1;
 
-      // PASO 1 — Posición de cadera: XZ escalado + Y corregido por contacto de pies
-      if (pData && sourceRootRef.current && targetRootRef.current) {
-        const sHipNow = new THREE.Vector3();
-        sourceRootRef.current.getWorldPosition(sHipNow);
+      const sHip = new THREE.Vector3(); sourceRootRef.current.getWorldPosition(sHip);
+      const tHip = new THREE.Vector3(); targetRootRef.current.getWorldPosition(tHip);
 
-        // Movimiento horizontal (X, Z): escalado por ratio de alturas base
-        const sHipDeltaX = (sHipNow.x - pData.sourceRestHip.x) * pData.scaleXZ;
-        const sHipDeltaZ = (sHipNow.z - pData.sourceRestHip.z) * pData.scaleXZ;
+      const applyLegIK = (side: 'left' | 'right') => {
+        const tFoot  = tFeet.current[side];
+        const sFoot  = sFeet.current[side];
+        if (!tFoot || !sFoot) return;
 
-        // Movimiento vertical (Y):
-        // Calculamos la posición Y del pie source ahora mismo
-        let sFootYNow = sHipNow.y; // fallback
-        const sLeft = sourceFootBonesRef.current.left;
-        const sRight = sourceFootBonesRef.current.right;
-        if (sLeft && sRight) {
-          const pL = new THREE.Vector3(); sLeft.getWorldPosition(pL);
-          const pR = new THREE.Vector3(); sRight.getWorldPosition(pR);
-          sFootYNow = Math.min(pL.y, pR.y); // Pie más bajo del source
-        } else if (sLeft) {
-          const p = new THREE.Vector3(); sLeft.getWorldPosition(p);
-          sFootYNow = p.y;
-        }
+        const tKnee  = tFoot.parent  as THREE.Bone;
+        const tThigh = tKnee?.parent as THREE.Bone;
+        if (!tKnee?.isBone || !tThigh?.isBone) return;
 
-        // La cadera target debe estar a la misma distancia relativa del piso
-        // que el source, pero proporcional a la longitud de las piernas del target
-        const sHipAboveFoot = sHipNow.y - sFootYNow; // qué tan alto están las caderas sobre el pie ahora
-        const ratio = pData.hipToFloorSource > 0 ? pData.hipToFloorTarget / pData.hipToFloorSource : 1;
-        const targetHipY = pData.targetRestHip.y + (sHipNow.y - pData.sourceRestHip.y) * ratio;
+        // ── P5 FIX: Posición absoluta del pie en Y (no relativa a tHip) ──
+        const sFootPos = new THREE.Vector3(); sFoot.getWorldPosition(sFootPos);
 
-        // Asignar posición resultante en espacio local de la cadera target
-        const tHipParent = targetRootRef.current.parent;
-        const newWorldPos = new THREE.Vector3(
-          pData.targetRestHip.x + sHipDeltaX,
-          targetHipY,
-          pData.targetRestHip.z + sHipDeltaZ
+        // XZ: offset relativo a la cadera source, escalado
+        const offsetX = (sFootPos.x - sHip.x) * calib.scaleXZ;
+        const offsetZ = (sFootPos.z - sHip.z) * calib.scaleXZ;
+
+        // Y: posición absoluta escalada desde el suelo
+        const targetFootY = Math.max(0, sFootPos.y * legRatio);
+
+        const targetFootPos = new THREE.Vector3(
+          tHip.x + offsetX,
+          targetFootY,
+          tHip.z + offsetZ,
         );
-        if (tHipParent) {
-          const invParent = new THREE.Matrix4().copy(tHipParent.matrixWorld).invert();
-          newWorldPos.applyMatrix4(invParent);
-        }
-        targetRootRef.current.position.copy(newWorldPos);
-        targetRootRef.current.updateMatrix();
-        if (targetRootRef.current.parent) {
-          targetRootRef.current.matrixWorld.multiplyMatrices(
-            targetRootRef.current.parent.matrixWorld,
-            targetRootRef.current.matrix
-          );
-        } else {
-          targetRootRef.current.matrixWorld.copy(targetRootRef.current.matrix);
-        }
-      }
 
-      // PASO 2 — Rotaciones con corrección de offsets de ejes locales
-      boneMapRef.current.forEach(({ source, target }) => {
-        const offset = offsetsRef.current.get(source.uuid);
-        if (!offset) return;
+        // ── P6 FIX: IK blend weight basado en velocidad del pie ───────────
+        const lastPos = lastFootPos.current[side];
+        const footVelocity = lastPos.distanceTo(sFootPos) / Math.max(delta, 0.001);
+        lastPos.copy(sFootPos);
 
-        const sWorld = new THREE.Quaternion();
-        source.getWorldQuaternion(sWorld);
+        // Velocidades tipicas en un Walk Mocap: ~0 cuando planta, ~200+ cuando swing
+        // Normalizamos en base a un umbral empírico
+        const plantThreshold = 30;  // unidades/seg → pie considerado plantado
+        const swingThreshold = 150; // unidades/seg → pie completamente en el aire
+        const rawWeight = 1.0 - THREE.MathUtils.smoothstep(footVelocity, plantThreshold, swingThreshold);
+        const ikWeight  = Math.max(0, Math.min(1, rawWeight));
 
-        const desiredTWorld = sWorld.multiply(offset);
+        // Aplicar IK con blend
+        applyTwoBoneIK(
+          tThigh,
+          tKnee,
+          tFoot,
+          targetFootPos,
+          ikWeight,
+          kneeFlexAxis.current[side]
+        );
+      };
 
-        const tParentWorld = new THREE.Quaternion();
-        if (target.parent) {
-          target.parent.getWorldQuaternion(tParentWorld);
-        }
-        
-        const tLocal = tParentWorld.invert().multiply(desiredTWorld);
-        target.quaternion.copy(tLocal);
-
-        target.updateMatrix();
-        if (target.parent) {
-          target.matrixWorld.multiplyMatrices(target.parent.matrixWorld, target.matrix);
-        } else {
-          target.matrixWorld.copy(target.matrix);
-        }
-      });
-
-      // PASO 3 — IK PASS (Cinemática Inversa para las Piernas)
-      // Esto fuerza a los pies a anclarse exactamente donde dice la animación, corrigiendo las proporciones
-      if (pData && sourceRootRef.current && targetRootRef.current) {
-        targetScene.updateMatrixWorld(true);
-        sourceScene.updateMatrixWorld(true);
-
-        const sHip = new THREE.Vector3(); sourceRootRef.current.getWorldPosition(sHip);
-        const tHip = new THREE.Vector3(); targetRootRef.current.getWorldPosition(tHip);
-        
-        // Ratio de longitud de pierna para la Y
-        const legRatio = pData.hipToFloorSource > 0 ? pData.hipToFloorTarget / pData.hipToFloorSource : 1;
-
-        // Función auxiliar para aplicar IK a una pierna
-        const applyLegIK = (side: 'left' | 'right') => {
-          const tFoot = targetFootBonesRef.current[side];
-          const sFoot = sourceFootBonesRef.current[side];
-          if (!tFoot || !sFoot) return;
-
-          // Buscar Rodilla y Cadera (Upper y Lower)
-          const tKnee = tFoot.parent as THREE.Bone;
-          const tThigh = tKnee?.parent as THREE.Bone;
-          if (!tKnee || !tThigh || !tKnee.isBone || !tThigh.isBone) return;
-
-          // Calcular dónde debería estar este pie en World Space para el Target
-          const sFootPos = new THREE.Vector3(); sFoot.getWorldPosition(sFootPos);
-          const footOffset = new THREE.Vector3().subVectors(sFootPos, sHip);
-          
-          // Escalar offset relativo a la cadera según proporciones del Target
-          footOffset.x *= pData.scaleXZ;
-          footOffset.z *= pData.scaleXZ;
-          footOffset.y *= legRatio;
-
-          const targetFootPos = new THREE.Vector3().addVectors(tHip, footOffset);
-
-          // Floor Clamp (Anti-Hundimiento preciso)
-          // Evitamos que el pie perfore el grid
-          if (targetFootPos.y < 0) {
-              targetFootPos.y = 0;
-          }
-
-          // Aplicar Cinemática Inversa Delta (Estable)
-          applyTwoBoneIK(tThigh, tKnee, tFoot, targetFootPos);
-        };
-
-        applyLegIK('left');
-        applyLegIK('right');
-      }
+      applyLegIK('left');
+      applyLegIK('right');
     }
   });
 
@@ -416,45 +428,46 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
   );
 }
 
+// ─── Viewer Shell ─────────────────────────────────────────────────────────────
+
 export default function RetargetingViewer() {
-  const targetFile = useRetargetStore(state => state.targetFile);
-  const sourceFile = useRetargetStore(state => state.sourceFile);
-  const showSourceSkeleton = useRetargetStore(state => state.showSourceSkeleton);
+  const targetFile         = useRetargetStore(s => s.targetFile);
+  const sourceFile         = useRetargetStore(s => s.sourceFile);
+  const showSourceSkeleton = useRetargetStore(s => s.showSourceSkeleton);
   const [cameraView, setCameraView] = useState<CameraViewPreset>(null);
 
   return (
     <div className="absolute inset-0">
       <Canvas camera={{ position: [0, 100, 400], fov: 50, far: 5000 }}>
         <color attach="background" args={['#282828']} />
-        
+
         <ambientLight intensity={1.5} />
         <directionalLight position={[100, 200, 100]} intensity={2} />
         <directionalLight position={[-100, -200, -100]} intensity={0.5} />
-        
+
         <axesHelper args={[100]} />
-        <Grid 
-          infiniteGrid 
-          fadeDistance={2000} 
-          sectionColor="#555555" 
-          cellColor="#363636" 
-          position={[0, 0, 0]} 
+        <Grid
+          infiniteGrid
+          fadeDistance={2000}
+          sectionColor="#555555"
+          cellColor="#363636"
+          position={[0, 0, 0]}
           sectionSize={10}
           cellSize={1}
         />
-        
+
         <Suspense fallback={null}>
-          <DualModel 
-            targetFile={targetFile} 
-            sourceFile={sourceFile} 
-            showSourceSkeleton={showSourceSkeleton} 
+          <DualModel
+            targetFile={targetFile}
+            sourceFile={sourceFile}
+            showSourceSkeleton={showSourceSkeleton}
           />
         </Suspense>
-        
+
         <CameraRig view={cameraView} centerY={100} distance={400} />
         <OrbitControls makeDefault target={[0, 100, 0]} dampingFactor={0.05} />
       </Canvas>
 
-      {/* Overlay de botones de vista — fuera del Canvas */}
       <ViewportOverlay onViewChange={setCameraView} />
     </div>
   );
