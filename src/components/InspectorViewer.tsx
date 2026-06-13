@@ -61,18 +61,8 @@ function InspectorModel({ url, type }: { url: string; type: 'fbx' | 'glb' | 'glt
           if ((child as THREE.Mesh).isMesh) {
             meshesCount++;
             const mesh = child as THREE.Mesh;
-            // Configura los materiales para que se vean bien
-            if (mesh.material) {
-              if (Array.isArray(mesh.material)) {
-                mesh.material.forEach(m => {
-                  m.transparent = true;
-                  m.opacity = 0.8; // Semi-transparente para ver los huesos a través de la malla
-                });
-              } else {
-                mesh.material.transparent = true;
-                mesh.material.opacity = 0.8;
-              }
-            }
+            // No forzamos transparencia aquí para evitar pérdida de contexto WebGL por sobrecarga de profundidad (Context Lost).
+            // El SkeletonHelper se verá a través de la malla usando depthTest = false.
             if (mesh.geometry && mesh.geometry.attributes.position) {
               verticesCount += mesh.geometry.attributes.position.count;
             }
@@ -128,9 +118,9 @@ export default function InspectorViewer() {
   return (
     <Canvas camera={{ position: [0, 100, 400], fov: 50, far: 5000 }}>
       <color attach="background" args={['#1e1e20']} />
-      <ambientLight intensity={0.8} />
-      <directionalLight position={[100, 200, 100]} intensity={1.5} />
-      <Environment preset="city" />
+      <ambientLight intensity={1.5} />
+      <directionalLight position={[100, 200, 100]} intensity={2} />
+      <directionalLight position={[-100, -200, -100]} intensity={0.5} />
       
       <axesHelper args={[100]} />
       <Grid 
