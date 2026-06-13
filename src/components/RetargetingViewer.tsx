@@ -31,9 +31,16 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
   const boneMapRef = useRef<{ source: THREE.Bone; target: THREE.Bone }[]>([]);
   const sourceRootRef = useRef<THREE.Bone | null>(null);
   const targetRootRef = useRef<THREE.Bone | null>(null);
-  const targetFootBonesRef = useRef<THREE.Bone[]>([]);
+  const sourceFootBonesRef = useRef<{ left: THREE.Bone | null, right: THREE.Bone | null }>({ left: null, right: null });
+  const targetFootBonesRef = useRef<{ left: THREE.Bone | null, right: THREE.Bone | null }>({ left: null, right: null });
   const offsetsRef = useRef<Map<string, THREE.Quaternion>>(new Map());
-  const positionDataRef = useRef<{ sourceRest: THREE.Vector3, targetRest: THREE.Vector3, scale: number, restFloorY?: number } | null>(null);
+  const positionDataRef = useRef<{ 
+    sourceRestHip: THREE.Vector3;
+    targetRestHip: THREE.Vector3;
+    scaleXZ: number;  // escala horizontal
+    hipToFloorSource: number; // distancia cadera→piso en source rest
+    hipToFloorTarget: number; // distancia cadera→piso en target rest
+  } | null>(null);
 
   // Evitar re-renders a 60fps usando getState() en useFrame
   const setDuration = useRetargetStore(state => state.setDuration);
@@ -164,42 +171,52 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
           });
           offsetsRef.current = offsets;
 
-          // 3. Calcular Diferencia de Escala para el desplazamiento espacial (Hips)
+          // 3. Calcular escala y datos de contacto de pies en WORLD SPACE
           if (sourceRootRef.current && targetRootRef.current) {
-            const sPos = sourceRootRef.current.position.clone();
-            const tPos = targetRootRef.current.position.clone();
-            let scale = sPos.y !== 0 ? tPos.y / sPos.y : 1;
-            
-            // Proporción basada en longitud de piernas (evita deslizamientos severos)
-            const tLeg = map.find(m => m.target.name === 'mixamorigLeftLeg')?.target;
-            const tFoot = map.find(m => m.target.name === 'mixamorigLeftFoot')?.target;
-            const sLeg = map.find(m => m.target.name === 'mixamorigLeftLeg')?.source;
-            const sFoot = map.find(m => m.target.name === 'mixamorigLeftFoot')?.source;
-            
-            if (tLeg && tFoot && sLeg && sFoot) {
-                const tLen = tLeg.position.length() + tFoot.position.length();
-                const sLen = sLeg.position.length() + sFoot.position.length();
-                if (sLen > 0) scale = tLen / sLen; // Reemplazamos escala de caderas por escala real de extremidades
+            // Forzar actualización de matrices en pose base
+            targetModel.updateMatrixWorld(true);
+            sourceModel.updateMatrixWorld(true);
+
+            const sHipWorld = new THREE.Vector3();
+            sourceRootRef.current.getWorldPosition(sHipWorld);
+            const tHipWorld = new THREE.Vector3();
+            targetRootRef.current.getWorldPosition(tHipWorld);
+
+            // Guardar refs de pies en world space
+            sourceFootBonesRef.current = { left: null, right: null };
+            targetFootBonesRef.current = { left: null, right: null };
+
+            map.forEach(({ source, target }) => {
+              if (source.name === 'LeftFoot')  sourceFootBonesRef.current.left  = source;
+              if (source.name === 'RightFoot') sourceFootBonesRef.current.right = source;
+              if (target.name === 'mixamorigLeftFoot')  targetFootBonesRef.current.left  = target;
+              if (target.name === 'mixamorigRightFoot') targetFootBonesRef.current.right = target;
+            });
+
+            // Medir la distancia cadera→pie en world space (= longitud real de la pierna)
+            let hipToFloorSource = sHipWorld.y; // Si no hay pie, usamos la altura de la cadera
+            if (sourceFootBonesRef.current.left) {
+              const p = new THREE.Vector3();
+              sourceFootBonesRef.current.left.getWorldPosition(p);
+              hipToFloorSource = sHipWorld.y - p.y;
             }
 
-            // 4. Calcular el piso base (Rest Floor Y) para Anti-Sinking
-            targetFootBonesRef.current = [];
-            let tRestFloorY = Infinity;
-            targetModel.traverse((node) => {
-                if ((node as THREE.Bone).isBone && ['mixamorigLeftFoot', 'mixamorigLeftToeBase', 'mixamorigRightFoot', 'mixamorigRightToeBase'].includes(node.name)) {
-                    targetFootBonesRef.current.push(node as THREE.Bone);
-                    const pos = new THREE.Vector3();
-                    node.getWorldPosition(pos);
-                    if (pos.y < tRestFloorY) tRestFloorY = pos.y;
-                }
-            });
-            if (tRestFloorY === Infinity) tRestFloorY = 0;
+            let hipToFloorTarget = tHipWorld.y;
+            if (targetFootBonesRef.current.left) {
+              const p = new THREE.Vector3();
+              targetFootBonesRef.current.left.getWorldPosition(p);
+              hipToFloorTarget = tHipWorld.y - p.y;
+            }
+
+            // Escala XZ: ratio de alturas de cadera (para movimiento horizontal correcto)
+            const scaleXZ = sHipWorld.y !== 0 ? tHipWorld.y / sHipWorld.y : 1;
 
             positionDataRef.current = {
-              sourceRest: sPos,
-              targetRest: tPos,
-              scale: Math.abs(scale),
-              restFloorY: tRestFloorY
+              sourceRestHip: sHipWorld,
+              targetRestHip: tHipWorld,
+              scaleXZ: Math.abs(scaleXZ),
+              hipToFloorSource,
+              hipToFloorTarget,
             };
           }
         }
@@ -258,72 +275,108 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
     if (boneMapRef.current.length > 0 && targetScene && sourceScene) {
       sourceScene.updateMatrixWorld(true);
 
-      // Transferir posición global primero para que la raíz tenga la matriz correcta
       const pData = positionDataRef.current;
+
+      // PASO 1 — Posición de cadera: XZ escalado + Y corregido por contacto de pies
       if (pData && sourceRootRef.current && targetRootRef.current) {
-         const sDelta = sourceRootRef.current.position.clone().sub(pData.sourceRest);
-         sDelta.multiplyScalar(pData.scale);
-         targetRootRef.current.position.copy(pData.targetRest).add(sDelta);
-         
-         targetRootRef.current.updateMatrix();
-         if (targetRootRef.current.parent) {
-           targetRootRef.current.matrixWorld.multiplyMatrices(targetRootRef.current.parent.matrixWorld, targetRootRef.current.matrix);
-         } else {
-           targetRootRef.current.matrixWorld.copy(targetRootRef.current.matrix);
-         }
+        const sHipNow = new THREE.Vector3();
+        sourceRootRef.current.getWorldPosition(sHipNow);
+
+        // Movimiento horizontal (X, Z): escalado por ratio de alturas base
+        const sHipDeltaX = (sHipNow.x - pData.sourceRestHip.x) * pData.scaleXZ;
+        const sHipDeltaZ = (sHipNow.z - pData.sourceRestHip.z) * pData.scaleXZ;
+
+        // Movimiento vertical (Y):
+        // Calculamos la posición Y del pie source ahora mismo
+        let sFootYNow = sHipNow.y; // fallback
+        const sLeft = sourceFootBonesRef.current.left;
+        const sRight = sourceFootBonesRef.current.right;
+        if (sLeft && sRight) {
+          const pL = new THREE.Vector3(); sLeft.getWorldPosition(pL);
+          const pR = new THREE.Vector3(); sRight.getWorldPosition(pR);
+          sFootYNow = Math.min(pL.y, pR.y); // Pie más bajo del source
+        } else if (sLeft) {
+          const p = new THREE.Vector3(); sLeft.getWorldPosition(p);
+          sFootYNow = p.y;
+        }
+
+        // La cadera target debe estar a la misma distancia relativa del piso
+        // que el source, pero proporcional a la longitud de las piernas del target
+        const sHipAboveFoot = sHipNow.y - sFootYNow; // qué tan alto están las caderas sobre el pie ahora
+        const ratio = pData.hipToFloorSource > 0 ? pData.hipToFloorTarget / pData.hipToFloorSource : 1;
+        const targetHipY = pData.targetRestHip.y + (sHipNow.y - pData.sourceRestHip.y) * ratio;
+
+        // Asignar posición resultante en espacio local de la cadera target
+        const tHipParent = targetRootRef.current.parent;
+        const newWorldPos = new THREE.Vector3(
+          pData.targetRestHip.x + sHipDeltaX,
+          targetHipY,
+          pData.targetRestHip.z + sHipDeltaZ
+        );
+        if (tHipParent) {
+          const invParent = new THREE.Matrix4().copy(tHipParent.matrixWorld).invert();
+          newWorldPos.applyMatrix4(invParent);
+        }
+        targetRootRef.current.position.copy(newWorldPos);
+        targetRootRef.current.updateMatrix();
+        if (targetRootRef.current.parent) {
+          targetRootRef.current.matrixWorld.multiplyMatrices(
+            targetRootRef.current.parent.matrixWorld,
+            targetRootRef.current.matrix
+          );
+        } else {
+          targetRootRef.current.matrixWorld.copy(targetRootRef.current.matrix);
+        }
       }
 
-      // Transferir rotaciones con corrección de offsets espaciales
+      // PASO 2 — Rotaciones con corrección de offsets de ejes locales
       boneMapRef.current.forEach(({ source, target }) => {
         const offset = offsetsRef.current.get(source.uuid);
         if (!offset) return;
 
-        // Obtener rotación del mundo actual de la animación
         const sWorld = new THREE.Quaternion();
         source.getWorldQuaternion(sWorld);
 
-        // Calcular la rotación del mundo deseada para el Target
         const desiredTWorld = sWorld.multiply(offset);
 
-        // Obtener la rotación del mundo del padre del Target
         const tParentWorld = new THREE.Quaternion();
         if (target.parent) {
           target.parent.getWorldQuaternion(tParentWorld);
         }
         
-        // Convertir mundo deseado a rotación local
         const tLocal = tParentWorld.invert().multiply(desiredTWorld);
         target.quaternion.copy(tLocal);
 
-        // Actualizar matriz local y mundial instantáneamente para evitar tearing en los hijos
         target.updateMatrix();
         if (target.parent) {
-            target.matrixWorld.multiplyMatrices(target.parent.matrixWorld, target.matrix);
+          target.matrixWorld.multiplyMatrices(target.parent.matrixWorld, target.matrix);
         } else {
-            target.matrixWorld.copy(target.matrix);
+          target.matrixWorld.copy(target.matrix);
         }
       });
 
-      // 4. Heurística Anti-Hundimiento de Pies (Auto-Grounding IK ligero)
-      if (pData && pData.restFloorY !== undefined && targetFootBonesRef.current.length > 0) {
-          // Asegurarnos que la escena calculó todas las rotaciones finales en World Space
-          targetScene.updateMatrixWorld(true);
-          
-          let currentLowestY = Infinity;
-          for (const foot of targetFootBonesRef.current) {
-              const pos = new THREE.Vector3();
-              foot.getWorldPosition(pos);
-              if (pos.y < currentLowestY) currentLowestY = pos.y;
+      // PASO 3 — Floor Clamp: Evitar que los pies pasen por debajo de Y=0
+      // Esto corrige cualquier residual de hundimiento frame a frame
+      if (targetRootRef.current && targetScene) {
+        targetScene.updateMatrixWorld(true);
+        const tLeft  = targetFootBonesRef.current.left;
+        const tRight = targetFootBonesRef.current.right;
+        let lowestY = Infinity;
+        
+        if (tLeft)  { const p = new THREE.Vector3(); tLeft.getWorldPosition(p);  if (p.y < lowestY) lowestY = p.y; }
+        if (tRight) { const p = new THREE.Vector3(); tRight.getWorldPosition(p); if (p.y < lowestY) lowestY = p.y; }
+
+        // El piso lógico es Y=0 (donde está el grid)
+        if (lowestY < 0) {
+          targetRootRef.current.position.y -= lowestY; // Empujar hacia arriba el error negativo
+          targetRootRef.current.updateMatrix();
+          if (targetRootRef.current.parent) {
+            targetRootRef.current.matrixWorld.multiplyMatrices(
+              targetRootRef.current.parent.matrixWorld,
+              targetRootRef.current.matrix
+            );
           }
-          
-          const errorY = pData.restFloorY - currentLowestY;
-          
-          // Si el pie más bajo perfora el piso original, levantamos las caderas dinámicamente
-          if (errorY > 0) {
-              targetRootRef.current!.position.y += errorY;
-              targetRootRef.current!.updateMatrix();
-              targetScene.updateMatrixWorld(true); // Refrescar visualización
-          }
+        }
       }
     }
   });
