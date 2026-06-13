@@ -10,6 +10,7 @@ import { useRetargetStore } from '@/store/useRetargetStore';
 import { getMixamoBoneName } from '@/lib/boneMap';
 import { CameraRig, type CameraViewPreset } from '@/components/CameraRig';
 import ViewportOverlay from '@/components/ViewportOverlay';
+import { applyTwoBoneIK } from '@/lib/ikSolver';
 
 async function loadFile(url: string, type: string) {
   if (type === 'fbx') {
@@ -357,28 +358,60 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
         }
       });
 
-      // PASO 3 — Floor Clamp: Evitar que los pies pasen por debajo de Y=0
-      // Esto corrige cualquier residual de hundimiento frame a frame
-      if (targetRootRef.current && targetScene) {
+      // PASO 3 — IK PASS (Cinemática Inversa para las Piernas)
+      // Esto fuerza a los pies a anclarse exactamente donde dice la animación, corrigiendo las proporciones
+      if (pData && sourceRootRef.current && targetRootRef.current) {
         targetScene.updateMatrixWorld(true);
-        const tLeft  = targetFootBonesRef.current.left;
-        const tRight = targetFootBonesRef.current.right;
-        let lowestY = Infinity;
-        
-        if (tLeft)  { const p = new THREE.Vector3(); tLeft.getWorldPosition(p);  if (p.y < lowestY) lowestY = p.y; }
-        if (tRight) { const p = new THREE.Vector3(); tRight.getWorldPosition(p); if (p.y < lowestY) lowestY = p.y; }
+        sourceScene.updateMatrixWorld(true);
 
-        // El piso lógico es Y=0 (donde está el grid)
-        if (lowestY < 0) {
-          targetRootRef.current.position.y -= lowestY; // Empujar hacia arriba el error negativo
-          targetRootRef.current.updateMatrix();
-          if (targetRootRef.current.parent) {
-            targetRootRef.current.matrixWorld.multiplyMatrices(
-              targetRootRef.current.parent.matrixWorld,
-              targetRootRef.current.matrix
-            );
+        const sHip = new THREE.Vector3(); sourceRootRef.current.getWorldPosition(sHip);
+        const tHip = new THREE.Vector3(); targetRootRef.current.getWorldPosition(tHip);
+        
+        // Ratio de longitud de pierna para la Y
+        const legRatio = pData.hipToFloorSource > 0 ? pData.hipToFloorTarget / pData.hipToFloorSource : 1;
+
+        // Función auxiliar para aplicar IK a una pierna
+        const applyLegIK = (side: 'left' | 'right') => {
+          const tFoot = targetFootBonesRef.current[side];
+          const sFoot = sourceFootBonesRef.current[side];
+          if (!tFoot || !sFoot) return;
+
+          // Buscar Rodilla y Cadera (Upper y Lower)
+          const tKnee = tFoot.parent as THREE.Bone;
+          const tThigh = tKnee?.parent as THREE.Bone;
+          if (!tKnee || !tThigh || !tKnee.isBone || !tThigh.isBone) return;
+
+          // Calcular dónde debería estar este pie en World Space para el Target
+          const sFootPos = new THREE.Vector3(); sFoot.getWorldPosition(sFootPos);
+          const footOffset = new THREE.Vector3().subVectors(sFootPos, sHip);
+          
+          // Escalar offset relativo a la cadera según proporciones del Target
+          footOffset.x *= pData.scaleXZ;
+          footOffset.z *= pData.scaleXZ;
+          footOffset.y *= legRatio;
+
+          const targetFootPos = new THREE.Vector3().addVectors(tHip, footOffset);
+
+          // Floor Clamp (Anti-Hundimiento preciso)
+          // Evitamos que el pie perfore el grid
+          if (targetFootPos.y < 0) {
+              targetFootPos.y = 0;
           }
-        }
+
+          // Calcular Hint direccional (Pole Vector). Hacia dónde apunta la rodilla en FK
+          const kneeFKPos = new THREE.Vector3(); tKnee.getWorldPosition(kneeFKPos);
+          const thighFKPos = new THREE.Vector3(); tThigh.getWorldPosition(thighFKPos);
+          const forwardHint = new THREE.Vector3().subVectors(kneeFKPos, thighFKPos).normalize();
+          // Añadir un sesgo hacia "adelante" en el espacio local de la cadera (z) si la pierna está estirada
+          const tRootForward = new THREE.Vector3(0, 0, 1).transformDirection(targetRootRef.current!.matrixWorld);
+          forwardHint.add(tRootForward.multiplyScalar(0.5)).normalize();
+
+          // Aplicar Cinemática Inversa
+          applyTwoBoneIK(tThigh, tKnee, tFoot, targetFootPos, forwardHint);
+        };
+
+        applyLegIK('left');
+        applyLegIK('right');
       }
     }
   });
