@@ -47,6 +47,18 @@ export default function Navbar() {
           <Search className="w-4 h-4" />
           Inspector y Extractor
         </Link>
+        <Link 
+          href="/retargeting"
+          className={cn(
+            "px-4 py-2 rounded-md text-sm font-medium transition-all flex items-center gap-2 text-purple-400",
+            pathname === '/retargeting' 
+              ? "bg-purple-900/40 text-purple-200 border border-purple-700 shadow-sm" 
+              : "hover:text-purple-300 hover:bg-purple-900/20 border border-transparent"
+          )}
+        >
+          <Activity className="w-4 h-4" />
+          Retargeting Lab
+        </Link>
       </nav>
     </header>
   );
