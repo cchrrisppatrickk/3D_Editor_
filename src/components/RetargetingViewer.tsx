@@ -34,6 +34,13 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
   const offsetsRef = useRef<Map<string, THREE.Quaternion>>(new Map());
   const positionDataRef = useRef<{ sourceRest: THREE.Vector3, targetRest: THREE.Vector3, scale: number } | null>(null);
 
+  // Evitar re-renders a 60fps usando getState() en useFrame
+  const setDuration = useRetargetStore(state => state.setDuration);
+  const setKeyframes = useRetargetStore(state => state.setKeyframes);
+  const setCurrentTime = useRetargetStore(state => state.setCurrentTime);
+  const durationRef = useRef(0);
+  const lastTimeRef = useRef(0);
+
   useEffect(() => {
     let active = true;
     boneMapRef.current = [];
@@ -77,11 +84,27 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
           });
           sourceRootRef.current = sRoot;
 
-          // Iniciar la animación del Mocap
+          // Iniciar la animación del Mocap y extraer datos para la línea de tiempo
           if (sourceModel.animations && sourceModel.animations.length > 0) {
+            const clip = sourceModel.animations[0];
             mixer.current = new THREE.AnimationMixer(sourceModel);
-            const action = mixer.current.clipAction(sourceModel.animations[0]);
+            const action = mixer.current.clipAction(clip);
             action.play();
+            
+            durationRef.current = clip.duration;
+            setDuration(clip.duration);
+
+            // Extraer tiempos únicos para pintar los keyframes (puntos) en el timeline
+            const uniqueTimes = new Set<number>();
+            for (const track of clip.tracks) {
+              if (track.times && track.times.length > 0) {
+                for (let i = 0; i < track.times.length; i++) {
+                  uniqueTimes.add(Number(track.times[i].toFixed(3))); 
+                }
+                break; // Con un solo track de mocap basta para conocer la cadencia de keyframes
+              }
+            }
+            setKeyframes(Array.from(uniqueTimes).sort((a, b) => a - b));
           }
 
           // Crear un visualizador visual (rosa) para los huesos origen
@@ -176,7 +199,32 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
   // Actualización Frame a Frame
   useFrame((state, delta) => {
     if (mixer.current) {
-      mixer.current.update(delta);
+      // Leemos el estado global directamente sin suscribir a React para no causar re-renders a 60fps
+      const { isPlaying, isScrubbing, currentTime } = useRetargetStore.getState();
+
+      if (isScrubbing) {
+        mixer.current.setTime(currentTime);
+        mixer.current.update(0); // Forzar que los huesos adopten la posición
+        lastTimeRef.current = currentTime;
+      } else {
+        // ¿Alguien dio click en el timeline u otra parte alterando el currentTime exteriormente?
+        if (Math.abs(currentTime - lastTimeRef.current) > 0.001 && !isPlaying) {
+            mixer.current.setTime(currentTime);
+            mixer.current.update(0);
+            lastTimeRef.current = currentTime;
+        }
+
+        if (isPlaying) {
+          mixer.current.update(delta);
+          
+          // Leer tiempo actual del action de loop
+          const action = mixer.current.clipAction(mixer.current._root.animations[0]);
+          if (action) {
+            setCurrentTime(action.time);
+            lastTimeRef.current = action.time;
+          }
+        }
+      }
     }
 
     // RETARGETING EN ACCIÓN

@@ -5,6 +5,7 @@ import { useRetargetStore } from '@/store/useRetargetStore';
 import dynamic from 'next/dynamic';
 import { Upload, Eye, EyeOff, FileBox } from 'lucide-react';
 import { useCallback } from 'react';
+import Timeline from '@/components/Timeline';
 
 const RetargetingViewer = dynamic(() => import('@/components/RetargetingViewer'), {
   ssr: false,
@@ -124,7 +125,10 @@ export default function RetargetingPage() {
       {/* 3D View Container */}
       <div className="flex-1 relative bg-[#282828]">
         {(targetFile || sourceFile) ? (
-          <RetargetingViewer />
+          <>
+            <RetargetingViewer />
+            <Timeline />
+          </>
         ) : (
           <div className="absolute inset-0 flex flex-col items-center justify-center text-center px-12">
             <div className="w-16 h-16 rounded-full bg-zinc-800 flex items-center justify-center mb-4 border border-zinc-700">
