@@ -86,14 +86,12 @@ export default function InspectorPage() {
   };
 
   return (
-    <main className="flex-1 w-full h-full flex overflow-hidden bg-zinc-950 relative">
-      <div {...getRootProps()} className="absolute inset-0 z-0">
-        <input {...getInputProps()} />
-      </div>
+    <main {...getRootProps()} className="flex-1 w-full h-full flex overflow-hidden bg-zinc-950 relative outline-none">
+      <input {...getInputProps()} />
       
       {/* 3D View Container */}
-      <div className="flex-1 relative pointer-events-none">
-        <div className="absolute inset-0 pointer-events-auto">
+      <div className="flex-1 relative">
+        <div className="absolute inset-0">
           {activeFile && <InspectorViewer />}
         </div>
         
