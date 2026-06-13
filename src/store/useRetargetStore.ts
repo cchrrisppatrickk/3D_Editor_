@@ -24,6 +24,12 @@ interface RetargetStore {
   setShowSourceSkeleton: (show: boolean) => void;
   clearAll: () => void;
 
+  // Export State
+  isBaking: boolean;
+  setIsBaking: (baking: boolean) => void;
+  exportAnimation: ((format: 'glb' | 'fbx') => Promise<void>) | null;
+  setExportAnimation: (fn: ((format: 'glb' | 'fbx') => Promise<void>) | null) => void;
+
   // Timeline Actions
   togglePlay: () => void;
   setDuration: (duration: number) => void;
@@ -42,6 +48,9 @@ export const useRetargetStore = create<RetargetStore>((set) => ({
   currentTime: 0,
   keyframes: [],
   isScrubbing: false,
+
+  isBaking: false,
+  exportAnimation: null,
 
   setTargetFile: (file) => set((state) => {
     if (state.targetFile && file?.id !== state.targetFile.id) {
@@ -62,8 +71,11 @@ export const useRetargetStore = create<RetargetStore>((set) => ({
   clearAll: () => set((state) => {
     if (state.targetFile) URL.revokeObjectURL(state.targetFile.fileUrl);
     if (state.sourceFile) URL.revokeObjectURL(state.sourceFile.fileUrl);
-    return { targetFile: null, sourceFile: null, duration: 0, currentTime: 0, keyframes: [] };
+    return { targetFile: null, sourceFile: null, duration: 0, currentTime: 0, keyframes: [], exportAnimation: null };
   }),
+
+  setIsBaking: (isBaking) => set({ isBaking }),
+  setExportAnimation: (exportAnimation) => set({ exportAnimation }),
 
   togglePlay: () => set((state) => ({ isPlaying: !state.isPlaying })),
   setDuration: (duration) => set({ duration }),

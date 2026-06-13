@@ -260,35 +260,8 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
     if (helper) helper.visible = showSourceSkeleton;
   }, [showSourceSkeleton, sourceScene]);
 
-  // ── Loop de animación ────────────────────────────────────────────────────
-
-  useFrame((_state, delta) => {
-    // — Playback del mixer —
-    if (mixer.current) {
-      const { isPlaying, isScrubbing, currentTime } = useRetargetStore.getState();
-
-      if (isScrubbing) {
-        mixer.current.setTime(currentTime);
-        mixer.current.update(0);
-        lastTimeRef.current = currentTime;
-      } else {
-        if (Math.abs(currentTime - lastTimeRef.current) > 0.001 && !isPlaying) {
-          mixer.current.setTime(currentTime);
-          mixer.current.update(0);
-          lastTimeRef.current = currentTime;
-        }
-        if (isPlaying) {
-          mixer.current.update(delta);
-          const anim = (mixer.current as any)._root?.animations?.[0];
-          const action = anim ? mixer.current.clipAction(anim) : null;
-          if (action) {
-            setCurrentTime(action.time);
-            lastTimeRef.current = action.time;
-          }
-        }
-      }
-    }
-
+  // ── Funciones de Retargeting (Refactor) ──────────────────────────────────
+  const processRetargetingPass = (delta: number) => {
     if (boneMapRef.current.length === 0 || !targetScene || !sourceScene) return;
 
     sourceScene.updateMatrixWorld(true);
@@ -403,14 +376,11 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
         const footVelocity = lastPos.distanceTo(sFootPos) / Math.max(delta, 0.001);
         lastPos.copy(sFootPos);
 
-        // Velocidades tipicas en un Walk Mocap: ~0 cuando planta, ~200+ cuando swing
-        // Normalizamos en base a un umbral empírico
-        const plantThreshold = 30;  // unidades/seg → pie considerado plantado
-        const swingThreshold = 150; // unidades/seg → pie completamente en el aire
+        const plantThreshold = 30;
+        const swingThreshold = 150;
         const rawWeight = 1.0 - THREE.MathUtils.smoothstep(footVelocity, plantThreshold, swingThreshold);
         const ikWeight  = Math.max(0, Math.min(1, rawWeight));
 
-        // Aplicar IK con blend
         applyTwoBoneIK(
           tThigh,
           tKnee,
@@ -424,6 +394,125 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
       applyLegIK('left');
       applyLegIK('right');
     }
+  };
+
+  // ── Motor de Baking y Exportación ────────────────────────────────────────
+  useEffect(() => {
+    const { setExportAnimation, setIsBaking } = useRetargetStore.getState();
+    
+    const bakeAndExport = async (format: 'glb' | 'fbx') => {
+      if (!targetScene || !mixer.current) return;
+      setIsBaking(true);
+      
+      try {
+        const anim = (mixer.current as any)._root?.animations?.[0] as THREE.AnimationClip | undefined;
+        if (!anim) throw new Error("No animation loaded");
+
+        // Pausar y clonar estado para no corromper la reproducción actual
+        const originalTime = mixer.current.time;
+        const originalPlaying = useRetargetStore.getState().isPlaying;
+
+        const fps = 60;
+        const totalFrames = Math.ceil(anim.duration * fps);
+        const times: number[] = [];
+        
+        const bonesToBake: THREE.Bone[] = [];
+        targetScene.traverse(node => {
+          if ((node as THREE.Bone).isBone) bonesToBake.push(node as THREE.Bone);
+        });
+
+        const positionArrays = new Map<string, number[]>();
+        const quaternionArrays = new Map<string, number[]>();
+        bonesToBake.forEach(b => {
+          positionArrays.set(b.uuid, []);
+          quaternionArrays.set(b.uuid, []);
+        });
+
+        // Loop de horneado (Baking)
+        for (let i = 0; i <= totalFrames; i++) {
+          const t = i / fps;
+          times.push(t);
+          
+          mixer.current.setTime(t);
+          mixer.current.update(0); // Force pose update
+          
+          // Ejecutar IK y Transferencia en modo sincrono
+          processRetargetingPass(1 / fps);
+          
+          bonesToBake.forEach(b => {
+            positionArrays.get(b.uuid)!.push(b.position.x, b.position.y, b.position.z);
+            quaternionArrays.get(b.uuid)!.push(b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w);
+          });
+        }
+
+        // Restaurar estado del visor
+        mixer.current.setTime(originalTime);
+
+        // Ensamblar los Keyframes a formato estándar
+        const tracks: THREE.KeyframeTrack[] = [];
+        bonesToBake.forEach(b => {
+          const name = b.name;
+          tracks.push(
+            new THREE.VectorKeyframeTrack(`${name}.position`, times, positionArrays.get(b.uuid)!),
+            new THREE.QuaternionKeyframeTrack(`${name}.quaternion`, times, quaternionArrays.get(b.uuid)!)
+          );
+        });
+
+        const bakedClip = new THREE.AnimationClip('RetargetedAnim', anim.duration, tracks);
+
+        // Llamar al módulo de exportación dinámico
+        const { exportToGLB, exportToFBX } = await import('../lib/exporters');
+        if (format === 'glb') {
+          await exportToGLB(targetScene, bakedClip, 'Mocap3D_Retarget.glb');
+        } else if (format === 'fbx') {
+          await exportToFBX(targetScene, bakedClip, 'Mocap3D_Retarget.fbx');
+        }
+
+      } catch (err) {
+        console.error("Error during baking/export:", err);
+        alert("Ocurrió un error al exportar la animación.");
+      } finally {
+        setIsBaking(false);
+      }
+    };
+
+    setExportAnimation(bakeAndExport);
+    return () => setExportAnimation(null);
+  }, [targetScene, sourceScene]);
+
+  // ── Loop de animación (Visor) ────────────────────────────────────────────
+
+  useFrame((_state, delta) => {
+    // Si estamos en proceso de baking, detenemos el render en vivo para ahorrar CPU
+    if (useRetargetStore.getState().isBaking) return;
+
+    // — Playback del mixer —
+    if (mixer.current) {
+      const { isPlaying, isScrubbing, currentTime } = useRetargetStore.getState();
+
+      if (isScrubbing) {
+        mixer.current.setTime(currentTime);
+        mixer.current.update(0);
+        lastTimeRef.current = currentTime;
+      } else {
+        if (Math.abs(currentTime - lastTimeRef.current) > 0.001 && !isPlaying) {
+          mixer.current.setTime(currentTime);
+          mixer.current.update(0);
+          lastTimeRef.current = currentTime;
+        }
+        if (isPlaying) {
+          mixer.current.update(delta);
+          const anim = (mixer.current as any)._root?.animations?.[0];
+          const action = anim ? mixer.current.clipAction(anim) : null;
+          if (action) {
+            setCurrentTime(action.time);
+            lastTimeRef.current = action.time;
+          }
+        }
+      }
+    }
+
+    processRetargetingPass(delta);
   });
 
   return (
