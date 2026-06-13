@@ -31,6 +31,8 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
   const boneMapRef = useRef<{ source: THREE.Bone; target: THREE.Bone }[]>([]);
   const sourceRootRef = useRef<THREE.Bone | null>(null);
   const targetRootRef = useRef<THREE.Bone | null>(null);
+  const offsetsRef = useRef<Map<string, THREE.Quaternion>>(new Map());
+  const positionDataRef = useRef<{ sourceRest: THREE.Vector3, targetRest: THREE.Vector3, scale: number } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -118,6 +120,38 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
           });
           
           boneMapRef.current = map;
+
+          // 1. Forzar actualización de matrices en la pose base (Rest Pose)
+          targetModel.updateMatrixWorld(true);
+          sourceModel.updateMatrixWorld(true);
+
+          // 2. Calcular Offsets de Cuaterniones (Diferencia de ejes locales entre Source y Target)
+          const offsets = new Map<string, THREE.Quaternion>();
+          map.forEach(({ source, target }) => {
+            const sWorld = new THREE.Quaternion();
+            source.getWorldQuaternion(sWorld);
+            
+            const tWorld = new THREE.Quaternion();
+            target.getWorldQuaternion(tWorld);
+            
+            // offset = sourceWorld^-1 * targetWorld
+            const offset = sWorld.invert().multiply(tWorld);
+            offsets.set(source.uuid, offset);
+          });
+          offsetsRef.current = offsets;
+
+          // 3. Calcular Diferencia de Escala para el desplazamiento espacial (Hips)
+          if (sourceRootRef.current && targetRootRef.current) {
+            const sPos = sourceRootRef.current.position.clone();
+            const tPos = targetRootRef.current.position.clone();
+            const scale = sPos.y !== 0 ? tPos.y / sPos.y : 1;
+            
+            positionDataRef.current = {
+              sourceRest: sPos,
+              targetRest: tPos,
+              scale: Math.abs(scale)
+            };
+          }
         }
 
       } catch (e) {
@@ -147,15 +181,53 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
 
     // RETARGETING EN ACCIÓN
     if (boneMapRef.current.length > 0 && targetScene && sourceScene) {
-      // Transferir rotaciones hueso por hueso según el mapeo
-      boneMapRef.current.forEach(({ source, target }) => {
-        target.quaternion.copy(source.quaternion);
-      });
-      
-      // Transferir posición global a través del hueso Raíz (Hips)
-      if (sourceRootRef.current && targetRootRef.current) {
-         targetRootRef.current.position.copy(sourceRootRef.current.position);
+      sourceScene.updateMatrixWorld(true);
+
+      // Transferir posición global primero para que la raíz tenga la matriz correcta
+      const pData = positionDataRef.current;
+      if (pData && sourceRootRef.current && targetRootRef.current) {
+         const sDelta = sourceRootRef.current.position.clone().sub(pData.sourceRest);
+         sDelta.multiplyScalar(pData.scale);
+         targetRootRef.current.position.copy(pData.targetRest).add(sDelta);
+         
+         targetRootRef.current.updateMatrix();
+         if (targetRootRef.current.parent) {
+           targetRootRef.current.matrixWorld.multiplyMatrices(targetRootRef.current.parent.matrixWorld, targetRootRef.current.matrix);
+         } else {
+           targetRootRef.current.matrixWorld.copy(targetRootRef.current.matrix);
+         }
       }
+
+      // Transferir rotaciones con corrección de offsets espaciales
+      boneMapRef.current.forEach(({ source, target }) => {
+        const offset = offsetsRef.current.get(source.uuid);
+        if (!offset) return;
+
+        // Obtener rotación del mundo actual de la animación
+        const sWorld = new THREE.Quaternion();
+        source.getWorldQuaternion(sWorld);
+
+        // Calcular la rotación del mundo deseada para el Target
+        const desiredTWorld = sWorld.multiply(offset);
+
+        // Obtener la rotación del mundo del padre del Target
+        const tParentWorld = new THREE.Quaternion();
+        if (target.parent) {
+          target.parent.getWorldQuaternion(tParentWorld);
+        }
+        
+        // Convertir mundo deseado a rotación local
+        const tLocal = tParentWorld.invert().multiply(desiredTWorld);
+        target.quaternion.copy(tLocal);
+
+        // Actualizar matriz local y mundial instantáneamente para evitar tearing en los hijos
+        target.updateMatrix();
+        if (target.parent) {
+            target.matrixWorld.multiplyMatrices(target.parent.matrixWorld, target.matrix);
+        } else {
+            target.matrixWorld.copy(target.matrix);
+        }
+      });
     }
   });
 
