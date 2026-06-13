@@ -31,8 +31,9 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
   const boneMapRef = useRef<{ source: THREE.Bone; target: THREE.Bone }[]>([]);
   const sourceRootRef = useRef<THREE.Bone | null>(null);
   const targetRootRef = useRef<THREE.Bone | null>(null);
+  const targetFootBonesRef = useRef<THREE.Bone[]>([]);
   const offsetsRef = useRef<Map<string, THREE.Quaternion>>(new Map());
-  const positionDataRef = useRef<{ sourceRest: THREE.Vector3, targetRest: THREE.Vector3, scale: number } | null>(null);
+  const positionDataRef = useRef<{ sourceRest: THREE.Vector3, targetRest: THREE.Vector3, scale: number, restFloorY?: number } | null>(null);
 
   // Evitar re-renders a 60fps usando getState() en useFrame
   const setDuration = useRetargetStore(state => state.setDuration);
@@ -167,12 +168,38 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
           if (sourceRootRef.current && targetRootRef.current) {
             const sPos = sourceRootRef.current.position.clone();
             const tPos = targetRootRef.current.position.clone();
-            const scale = sPos.y !== 0 ? tPos.y / sPos.y : 1;
+            let scale = sPos.y !== 0 ? tPos.y / sPos.y : 1;
             
+            // Proporción basada en longitud de piernas (evita deslizamientos severos)
+            const tLeg = map.find(m => m.target.name === 'mixamorigLeftLeg')?.target;
+            const tFoot = map.find(m => m.target.name === 'mixamorigLeftFoot')?.target;
+            const sLeg = map.find(m => m.target.name === 'mixamorigLeftLeg')?.source;
+            const sFoot = map.find(m => m.target.name === 'mixamorigLeftFoot')?.source;
+            
+            if (tLeg && tFoot && sLeg && sFoot) {
+                const tLen = tLeg.position.length() + tFoot.position.length();
+                const sLen = sLeg.position.length() + sFoot.position.length();
+                if (sLen > 0) scale = tLen / sLen; // Reemplazamos escala de caderas por escala real de extremidades
+            }
+
+            // 4. Calcular el piso base (Rest Floor Y) para Anti-Sinking
+            targetFootBonesRef.current = [];
+            let tRestFloorY = Infinity;
+            targetModel.traverse((node) => {
+                if ((node as THREE.Bone).isBone && ['mixamorigLeftFoot', 'mixamorigLeftToeBase', 'mixamorigRightFoot', 'mixamorigRightToeBase'].includes(node.name)) {
+                    targetFootBonesRef.current.push(node as THREE.Bone);
+                    const pos = new THREE.Vector3();
+                    node.getWorldPosition(pos);
+                    if (pos.y < tRestFloorY) tRestFloorY = pos.y;
+                }
+            });
+            if (tRestFloorY === Infinity) tRestFloorY = 0;
+
             positionDataRef.current = {
               sourceRest: sPos,
               targetRest: tPos,
-              scale: Math.abs(scale)
+              scale: Math.abs(scale),
+              restFloorY: tRestFloorY
             };
           }
         }
@@ -276,6 +303,28 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
             target.matrixWorld.copy(target.matrix);
         }
       });
+
+      // 4. Heurística Anti-Hundimiento de Pies (Auto-Grounding IK ligero)
+      if (pData && pData.restFloorY !== undefined && targetFootBonesRef.current.length > 0) {
+          // Asegurarnos que la escena calculó todas las rotaciones finales en World Space
+          targetScene.updateMatrixWorld(true);
+          
+          let currentLowestY = Infinity;
+          for (const foot of targetFootBonesRef.current) {
+              const pos = new THREE.Vector3();
+              foot.getWorldPosition(pos);
+              if (pos.y < currentLowestY) currentLowestY = pos.y;
+          }
+          
+          const errorY = pData.restFloorY - currentLowestY;
+          
+          // Si el pie más bajo perfora el piso original, levantamos las caderas dinámicamente
+          if (errorY > 0) {
+              targetRootRef.current!.position.y += errorY;
+              targetRootRef.current!.updateMatrix();
+              targetScene.updateMatrixWorld(true); // Refrescar visualización
+          }
+      }
     }
   });
 
