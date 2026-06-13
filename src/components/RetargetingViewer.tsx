@@ -57,7 +57,9 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
 
   const mixer           = useRef<THREE.AnimationMixer | null>(null);
   const boneMapRef      = useRef<{ source: THREE.Bone; target: THREE.Bone }[]>([]);
-  const offsetsRef      = useRef<Map<string, THREE.Quaternion>>(new Map());
+  // Offsets en LOCAL Space: guardamos la rotación local en rest pose de source y target
+  // offset = T_local_rest * S_local_rest^-1  (cambio de base en espacio local)
+  const offsetsRef      = useRef<Map<string, { offset: THREE.Quaternion }>>(new Map());
   const calibRef        = useRef<CalibrationData | null>(null);
   const sourceRootRef   = useRef<THREE.Bone | null>(null);
   const targetRootRef   = useRef<THREE.Bone | null>(null);
@@ -178,19 +180,23 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
           targetModel.updateMatrixWorld(true);
           sourceModel.updateMatrixWorld(true);
 
-          // ── P1 FIX: Offset correcto = T_world * S_world_inv ────────────────
-          // Esto nos da el "cambio de base" del esqueleto source al target en rest pose.
-          // Al aplicarlo en runtime: desired_T_world = offset * S_world_current
-          const offsets = new Map<string, THREE.Quaternion>();
+          // ── Offset en LOCAL Space (estable, sin acumulación de errores) ────
+          // Idea: en rest pose, el offset de un hueso es la diferencia entre
+          // su rotación local en el rig source vs el rig target.
+          // En runtime: T_local_anim = offset * S_local_anim
+          //
+          // Esto evita el problema de World Space donde los errores se acumulan
+          // a través de la cadena de huesos padre→hijo.
+          const offsets = new Map<string, { offset: THREE.Quaternion }>();
           map.forEach(({ source, target }) => {
-            const sWorld = new THREE.Quaternion();
-            const tWorld = new THREE.Quaternion();
-            source.getWorldQuaternion(sWorld);
-            target.getWorldQuaternion(tWorld);
+            // Rotaciones locales en rest pose (son constantes, son las del bind pose)
+            const sLocalRest = source.quaternion.clone();  // rotación local source en rest
+            const tLocalRest = target.quaternion.clone();  // rotación local target en rest
 
-            // T * S^-1  (Correct retargeting offset)
-            const offset = tWorld.clone().multiply(sWorld.clone().invert());
-            offsets.set(source.uuid, offset);
+            // offset = T_local_rest * S_local_rest^-1
+            // Esto captura la diferencia de orientación local entre los dos rigs en reposo
+            const offset = tLocalRest.clone().multiply(sLocalRest.clone().invert());
+            offsets.set(source.uuid, { offset });
           });
           offsetsRef.current = offsets;
 
@@ -331,22 +337,21 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
       }
     }
 
-    // ── PASO 2 — Rotaciones con offset corregido (T * S^-1) ──────────────
-    // Fórmula correcta: desired_T_world = offset * S_world_current
+    // ── PASO 2 — Rotaciones en LOCAL Space ───────────────────────────────
+    // Fórmula: T_local_anim = offset * S_local_anim
+    // Donde offset = T_local_rest * S_local_rest^-1 (calculado en init)
+    // Trabajamos en Local Space para evitar la acumulación de errores de World Space.
     boneMapRef.current.forEach(({ source, target }) => {
-      const offset = offsetsRef.current.get(source.uuid);
-      if (!offset) return;
+      const entry = offsetsRef.current.get(source.uuid);
+      if (!entry) return;
 
-      const sWorld = new THREE.Quaternion();
-      source.getWorldQuaternion(sWorld);
+      // Rotación local ACTUAL del source (la animación ya la modificó vía el mixer)
+      const sLocalNow = source.quaternion.clone();
 
-      // desired = offset * sWorld  (P1 fix — antes era sWorld * offset)
-      const desiredTWorld = offset.clone().multiply(sWorld);
+      // Aplicar offset en local space: desired_T_local = offset * S_local_current
+      const desiredTLocal = entry.offset.clone().multiply(sLocalNow);
+      target.quaternion.copy(desiredTLocal);
 
-      const tParentWorld = new THREE.Quaternion();
-      if (target.parent) target.parent.getWorldQuaternion(tParentWorld);
-
-      target.quaternion.copy(tParentWorld.invert().multiply(desiredTWorld));
       target.updateMatrix();
       if (target.parent) {
         target.matrixWorld.multiplyMatrices(target.parent.matrixWorld, target.matrix);
