@@ -7,6 +7,8 @@ import * as THREE from 'three';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { useViewerStore } from '@/store/useViewerStore';
+import { CameraRig, type CameraViewPreset } from '@/components/CameraRig';
+import ViewportOverlay from '@/components/ViewportOverlay';
 
 function Model({ url, type }: { url: string; type: 'fbx' | 'glb' | 'gltf' }) {
   const [scene, setScene] = useState<THREE.Group | THREE.Scene | null>(null);
@@ -101,6 +103,7 @@ function Model({ url, type }: { url: string; type: 'fbx' | 'glb' | 'gltf' }) {
 export default function MocapViewer() {
   const activeAnimationId = useViewerStore((state) => state.activeAnimationId);
   const animations = useViewerStore((state) => state.animations);
+  const [cameraView, setCameraView] = useState<CameraViewPreset>(null);
 
   const activeAnim = useMemo(() => 
     animations.find(a => a.id === activeAnimationId), 
@@ -135,15 +138,20 @@ export default function MocapViewer() {
           <Model url={activeAnim.fileUrl} type={activeAnim.type} />
         </Suspense>
         
+        <CameraRig view={cameraView} centerY={100} distance={400} />
         <OrbitControls makeDefault target={[0, 100, 0]} dampingFactor={0.05} />
       </Canvas>
       
+      {/* Overlay de nombre de animación */}
       <div className="absolute top-4 left-4 bg-black/50 backdrop-blur px-4 py-2 rounded-lg border border-white/10 pointer-events-none">
         <p className="text-white font-mono text-sm flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
           Reproduciendo: <span className="text-blue-400 ml-1">{activeAnim.name}</span>
         </p>
       </div>
+
+      {/* Overlay de botones de vista */}
+      <ViewportOverlay onViewChange={setCameraView} />
     </div>
   );
 }

@@ -8,6 +8,8 @@ import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { useRetargetStore } from '@/store/useRetargetStore';
 import { getMixamoBoneName } from '@/lib/boneMap';
+import { CameraRig, type CameraViewPreset } from '@/components/CameraRig';
+import ViewportOverlay from '@/components/ViewportOverlay';
 
 async function loadFile(url: string, type: string) {
   if (type === 'fbx') {
@@ -393,35 +395,42 @@ export default function RetargetingViewer() {
   const targetFile = useRetargetStore(state => state.targetFile);
   const sourceFile = useRetargetStore(state => state.sourceFile);
   const showSourceSkeleton = useRetargetStore(state => state.showSourceSkeleton);
+  const [cameraView, setCameraView] = useState<CameraViewPreset>(null);
 
   return (
-    <Canvas camera={{ position: [0, 100, 400], fov: 50, far: 5000 }}>
-      <color attach="background" args={['#282828']} />
-      
-      <ambientLight intensity={1.5} />
-      <directionalLight position={[100, 200, 100]} intensity={2} />
-      <directionalLight position={[-100, -200, -100]} intensity={0.5} />
-      
-      <axesHelper args={[100]} />
-      <Grid 
-        infiniteGrid 
-        fadeDistance={2000} 
-        sectionColor="#555555" 
-        cellColor="#363636" 
-        position={[0, 0, 0]} 
-        sectionSize={10}
-        cellSize={1}
-      />
-      
-      <Suspense fallback={null}>
-        <DualModel 
-          targetFile={targetFile} 
-          sourceFile={sourceFile} 
-          showSourceSkeleton={showSourceSkeleton} 
+    <div className="absolute inset-0">
+      <Canvas camera={{ position: [0, 100, 400], fov: 50, far: 5000 }}>
+        <color attach="background" args={['#282828']} />
+        
+        <ambientLight intensity={1.5} />
+        <directionalLight position={[100, 200, 100]} intensity={2} />
+        <directionalLight position={[-100, -200, -100]} intensity={0.5} />
+        
+        <axesHelper args={[100]} />
+        <Grid 
+          infiniteGrid 
+          fadeDistance={2000} 
+          sectionColor="#555555" 
+          cellColor="#363636" 
+          position={[0, 0, 0]} 
+          sectionSize={10}
+          cellSize={1}
         />
-      </Suspense>
-      
-      <OrbitControls makeDefault target={[0, 100, 0]} dampingFactor={0.05} />
-    </Canvas>
+        
+        <Suspense fallback={null}>
+          <DualModel 
+            targetFile={targetFile} 
+            sourceFile={sourceFile} 
+            showSourceSkeleton={showSourceSkeleton} 
+          />
+        </Suspense>
+        
+        <CameraRig view={cameraView} centerY={100} distance={400} />
+        <OrbitControls makeDefault target={[0, 100, 0]} dampingFactor={0.05} />
+      </Canvas>
+
+      {/* Overlay de botones de vista — fuera del Canvas */}
+      <ViewportOverlay onViewChange={setCameraView} />
+    </div>
   );
 }
