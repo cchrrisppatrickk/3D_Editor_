@@ -12,6 +12,8 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+import Navbar from "@/components/Navbar";
+
 export const metadata: Metadata = {
   title: "Mocap3D Pro Viewer",
   description: "Visor profesional de capturas de movimiento (skeleton-only)",
@@ -27,7 +29,10 @@ export default function RootLayout({
       lang="es"
       className={`${geistSans.variable} ${geistMono.variable} h-full overflow-hidden antialiased`}
     >
-      <body className="h-full overflow-hidden m-0 p-0">{children}</body>
+      <body className="h-full overflow-hidden m-0 p-0 flex flex-col bg-zinc-950 text-white">
+        <Navbar />
+        {children}
+      </body>
     </html>
   );
 }

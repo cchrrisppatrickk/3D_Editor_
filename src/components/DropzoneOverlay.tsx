@@ -24,7 +24,7 @@ export default function DropzoneOverlay({ children }: { children: React.ReactNod
   });
 
   return (
-    <div {...getRootProps()} className="w-full h-screen overflow-hidden relative bg-zinc-950 flex">
+    <div {...getRootProps()} className="flex-1 w-full h-full overflow-hidden relative bg-zinc-950 flex">
       <input {...getInputProps()} />
       
       {/* Background/Overlay Dropzone */}
