@@ -398,16 +398,8 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
               targetFootPos.y = 0;
           }
 
-          // Calcular Hint direccional (Pole Vector). Hacia dónde apunta la rodilla en FK
-          const kneeFKPos = new THREE.Vector3(); tKnee.getWorldPosition(kneeFKPos);
-          const thighFKPos = new THREE.Vector3(); tThigh.getWorldPosition(thighFKPos);
-          const forwardHint = new THREE.Vector3().subVectors(kneeFKPos, thighFKPos).normalize();
-          // Añadir un sesgo hacia "adelante" en el espacio local de la cadera (z) si la pierna está estirada
-          const tRootForward = new THREE.Vector3(0, 0, 1).transformDirection(targetRootRef.current!.matrixWorld);
-          forwardHint.add(tRootForward.multiplyScalar(0.5)).normalize();
-
-          // Aplicar Cinemática Inversa
-          applyTwoBoneIK(tThigh, tKnee, tFoot, targetFootPos, forwardHint);
+          // Aplicar Cinemática Inversa Delta (Estable)
+          applyTwoBoneIK(tThigh, tKnee, tFoot, targetFootPos);
         };
 
         applyLegIK('left');

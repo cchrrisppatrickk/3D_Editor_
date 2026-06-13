@@ -1,97 +1,70 @@
 import * as THREE from 'three';
 
-/**
- * Analytical Two-Bone Inverse Kinematics (IK) Solver.
- * Solves the exact rotations for an Upper and Lower bone so that the Effector (child of Lower)
- * reaches the targetPosition in World Space.
- * 
- * @param upperBone La cadera o el hombro (Hip/Shoulder)
- * @param lowerBone La rodilla o el codo (Knee/Elbow)
- * @param effectorBone El tobillo o la muñeca (Ankle/Wrist)
- * @param targetPosition La posición en el mundo a la que queremos llegar
- * @param forwardHint Un vector en el mundo que indica hacia dónde debe "apuntar" la rodilla (ej. adelante)
- */
 export function applyTwoBoneIK(
     upperBone: THREE.Bone, 
     lowerBone: THREE.Bone, 
     effectorBone: THREE.Bone, 
-    targetPosition: THREE.Vector3, 
-    forwardHint: THREE.Vector3
+    targetPosition: THREE.Vector3
 ) {
     upperBone.updateMatrixWorld(true);
     
-    // Obtener posiciones en el mundo (World Space)
+    // Obtener posiciones FK actuales
     const a = new THREE.Vector3(); upperBone.getWorldPosition(a);
     const b = new THREE.Vector3(); lowerBone.getWorldPosition(b);
     const c = new THREE.Vector3(); effectorBone.getWorldPosition(c);
 
-    // Longitudes fijas de los huesos
     const L1 = a.distanceTo(b);
     const L2 = b.distanceTo(c);
-    
-    // Distancia deseada desde la raíz hasta el objetivo
-    let D = a.distanceTo(targetPosition);
-    
-    // Limitar la distancia para evitar hiperextensión (huesos estirados al máximo) o compresión extrema
-    D = Math.max(Math.abs(L1 - L2) + 0.001, Math.min(D, L1 + L2 - 0.001));
 
-    // 1. Determinar el plano de rotación (Normal)
-    // El objetivo es apuntar hacia el target, pero la rodilla debe apuntar hacia el forwardHint
-    const dirTarget = new THREE.Vector3().subVectors(targetPosition, a).normalize();
-    const poleDir = forwardHint.clone().normalize();
+    if (L1 < 0.001 || L2 < 0.001) return; // Prevenir NaN si los huesos miden 0
     
-    let normal = new THREE.Vector3().crossVectors(dirTarget, poleDir);
-    
-    if (normal.lengthSq() < 0.001) {
-        // Fallback: Si el target y el pole son colineales, usamos la orientación actual de la rodilla (FK)
-        const dirB = new THREE.Vector3().subVectors(b, a).normalize();
-        normal.crossVectors(dirTarget, dirB);
-        if (normal.lengthSq() < 0.001) normal.set(1, 0, 0); // Extremo: forzar un eje arbitrario
-    }
-    normal.normalize();
+    // Distancia deseada
+    let targetDist = a.distanceTo(targetPosition);
+    targetDist = Math.max(Math.abs(L1 - L2) + 0.001, Math.min(targetDist, L1 + L2 - 0.001));
 
-    // 2. Resolver el triángulo usando la Ley de Cosenos para el fémur (Ángulo en A)
-    const cosA = (L1 * L1 + D * D - L2 * L2) / (2 * L1 * D);
-    const angleA = Math.acos(Math.max(-1, Math.min(1, cosA)));
-
-    // Nueva dirección para el Fémur (A -> B). Rotamos la dirección del target por el ángulo calculado
-    // Según la regla de la mano derecha, rotar en torno a cross(dirTarget, poleDir) lo mueve hacia poleDir.
-    const newDirAB = dirTarget.clone().applyAxisAngle(normal, angleA);
-
-    // 3. Aplicar rotación al UpperBone (Cadera)
-    const currentDirAB = new THREE.Vector3().subVectors(b, a).normalize();
-    const q1 = new THREE.Quaternion().setFromUnitVectors(currentDirAB, newDirAB);
+    // PASO 1: Ajustar el doblez de la rodilla (Lower Bone)
+    // Distancia FK actual
+    const currentDist = Math.max(Math.abs(L1 - L2) + 0.001, Math.min(a.distanceTo(c), L1 + L2 - 0.001));
     
-    const upperWorld = new THREE.Quaternion();
-    upperBone.getWorldQuaternion(upperWorld);
-    const newUpperWorld = q1.multiply(upperWorld); // q1 * current_world_rot
-    
-    const pWorld = new THREE.Quaternion();
-    if (upperBone.parent) upperBone.parent.getWorldQuaternion(pWorld);
-    
-    // Transformar a espacio local y asignar
-    upperBone.quaternion.copy(pWorld.invert().multiply(newUpperWorld));
-    upperBone.updateMatrixWorld(true);
+    // Ángulo interno actual de la rodilla según la Ley de Cosenos
+    const currentCosKnee = (L1 * L1 + L2 * L2 - currentDist * currentDist) / (2 * L1 * L2);
+    const currentAngleKnee = Math.acos(Math.max(-1, Math.min(1, currentCosKnee)));
 
-    // 4. Aplicar rotación al LowerBone (Rodilla)
-    // Ahora B se ha movido porque A rotó. Obtenemos la nueva posición de B.
-    const newB = new THREE.Vector3(); lowerBone.getWorldPosition(newB);
+    // Ángulo interno deseado para alcanzar la distancia del target
+    const targetCosKnee = (L1 * L1 + L2 * L2 - targetDist * targetDist) / (2 * L1 * L2);
+    const targetAngleKnee = Math.acos(Math.max(-1, Math.min(1, targetCosKnee)));
+
+    // Diferencia angular a aplicar.
+    // La mayoría de los rigs (incluyendo Mixamo) doblan la rodilla primariamente en su eje X local.
+    // Si la pierna se está estirando (targetDist > currentDist), el ángulo interno CRECE.
+    const deltaKneeAngle = targetAngleKnee - currentAngleKnee;
+    
+    // Aplicamos el delta directamente a la rotación local en X.
+    // Usamos el signo adecuado (en Mixamo, la rodilla suele tener un doblez positivo en X).
+    lowerBone.rotateX(-deltaKneeAngle);
+    lowerBone.updateMatrixWorld(true);
+
+    // PASO 2: Apuntar toda la pierna (Upper Bone) hacia el Target
+    // Ahora que la rodilla está doblada correctamente, el tobillo (C) está a la distancia correcta de A,
+    // pero apuntando en la dirección original.
     const newC = new THREE.Vector3(); effectorBone.getWorldPosition(newC);
     
-    const currentDirBC = new THREE.Vector3().subVectors(newC, newB).normalize();
-    // La tibia (B->C) debe apuntar directamente al objetivo final
-    const newDirBC = new THREE.Vector3().subVectors(targetPosition, newB).normalize();
+    const currentDir = new THREE.Vector3().subVectors(newC, a).normalize();
+    const targetDir = new THREE.Vector3().subVectors(targetPosition, a).normalize();
+
+    if (currentDir.lengthSq() < 0.001 || targetDir.lengthSq() < 0.001) return;
+
+    // Calcular la rotación necesaria para alinear la pierna con el target
+    const alignQuat = new THREE.Quaternion().setFromUnitVectors(currentDir, targetDir);
+
+    // Aplicarla al UpperBone en World Space
+    const upperWorld = new THREE.Quaternion();
+    upperBone.getWorldQuaternion(upperWorld);
+    const newUpperWorld = alignQuat.multiply(upperWorld); // alignQuat * upperWorld
     
-    const q2 = new THREE.Quaternion().setFromUnitVectors(currentDirBC, newDirBC);
+    const parentWorld = new THREE.Quaternion();
+    if (upperBone.parent) upperBone.parent.getWorldQuaternion(parentWorld);
     
-    const lowerWorld = new THREE.Quaternion();
-    lowerBone.getWorldQuaternion(lowerWorld);
-    const newLowerWorld = q2.multiply(lowerWorld);
-    
-    const pWorld2 = new THREE.Quaternion();
-    if (lowerBone.parent) lowerBone.parent.getWorldQuaternion(pWorld2);
-    
-    // Transformar a espacio local y asignar
-    lowerBone.quaternion.copy(pWorld2.invert().multiply(newLowerWorld));
-    lowerBone.updateMatrixWorld(true);
+    upperBone.quaternion.copy(parentWorld.invert().multiply(newUpperWorld));
+    upperBone.updateMatrixWorld(true);
 }
