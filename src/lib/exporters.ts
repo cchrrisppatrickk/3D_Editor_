@@ -65,7 +65,7 @@ export async function exportToFBX(scene: THREE.Object3D, clip: THREE.AnimationCl
     // exportFbx devuelve un Uint8Array para formato binario
     const fbxBuffer = exportFbx(scene);
     
-    const blob = new Blob([fbxBuffer], { type: 'application/octet-stream' });
+    const blob = new Blob([fbxBuffer as any], { type: 'application/octet-stream' });
     downloadBlob(blob, filename);
 
     // Restaurar
