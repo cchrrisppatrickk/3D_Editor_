@@ -180,22 +180,19 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
           targetModel.updateMatrixWorld(true);
           sourceModel.updateMatrixWorld(true);
 
-          // ── Offset en LOCAL Space (estable, sin acumulación de errores) ────
-          // Idea: en rest pose, el offset de un hueso es la diferencia entre
-          // su rotación local en el rig source vs el rig target.
-          // En runtime: T_local_anim = offset * S_local_anim
-          //
-          // Esto evita el problema de World Space donde los errores se acumulan
-          // a través de la cadena de huesos padre→hijo.
+          // ── P1 FIX (CORREGIDO): World Space Delta Retargeting ───────────────
+          // La fórmula correcta para retargeting universal es calcular el delta
+          // de rotación en World Space y aplicarlo a la pose de reposo del target.
+          // offset = S_rest_world^-1 * T_rest_world
           const offsets = new Map<string, { offset: THREE.Quaternion }>();
           map.forEach(({ source, target }) => {
-            // Rotaciones locales en rest pose (son constantes, son las del bind pose)
-            const sLocalRest = source.quaternion.clone();  // rotación local source en rest
-            const tLocalRest = target.quaternion.clone();  // rotación local target en rest
+            const sWorldRest = new THREE.Quaternion();
+            const tWorldRest = new THREE.Quaternion();
+            source.getWorldQuaternion(sWorldRest);
+            target.getWorldQuaternion(tWorldRest);
 
-            // offset = T_local_rest * S_local_rest^-1
-            // Esto captura la diferencia de orientación local entre los dos rigs en reposo
-            const offset = tLocalRest.clone().multiply(sLocalRest.clone().invert());
+            // offset guarda la diferencia de orientación en rest pose
+            const offset = sWorldRest.clone().invert().multiply(tWorldRest);
             offsets.set(source.uuid, { offset });
           });
           offsetsRef.current = offsets;
@@ -337,20 +334,24 @@ function DualModel({ targetFile, sourceFile, showSourceSkeleton }: any) {
       }
     }
 
-    // ── PASO 2 — Rotaciones en LOCAL Space ───────────────────────────────
-    // Fórmula: T_local_anim = offset * S_local_anim
-    // Donde offset = T_local_rest * S_local_rest^-1 (calculado en init)
-    // Trabajamos en Local Space para evitar la acumulación de errores de World Space.
+    // ── PASO 2 — Rotaciones en World Space (Correcto) ────────────────────────
+    // Fórmula: T_anim_world = S_anim_world * (S_rest_world^-1 * T_rest_world)
+    // Esto asegura que la diferencia de pose base se respete siempre en world space
     boneMapRef.current.forEach(({ source, target }) => {
       const entry = offsetsRef.current.get(source.uuid);
       if (!entry) return;
 
-      // Rotación local ACTUAL del source (la animación ya la modificó vía el mixer)
-      const sLocalNow = source.quaternion.clone();
+      const sWorldNow = new THREE.Quaternion();
+      source.getWorldQuaternion(sWorldNow);
 
-      // Aplicar offset en local space: desired_T_local = offset * S_local_current
-      const desiredTLocal = entry.offset.clone().multiply(sLocalNow);
-      target.quaternion.copy(desiredTLocal);
+      // desired_T_world = sWorldNow * offset
+      const desiredTWorld = sWorldNow.multiply(entry.offset);
+
+      // Convertir a Local Space del padre para asignarlo
+      const tParentWorld = new THREE.Quaternion();
+      if (target.parent) target.parent.getWorldQuaternion(tParentWorld);
+
+      target.quaternion.copy(tParentWorld.invert().multiply(desiredTWorld));
 
       target.updateMatrix();
       if (target.parent) {
